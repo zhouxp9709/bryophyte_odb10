@@ -1,15 +1,40 @@
+
 #!/bin/bash
 
-# Setup environment and variables
+# Set environment and variables
 set -e
 PEP_DIR="/vol2/BUSCO/bryophyte/HOG/02.copy.pep"
-OUTPUT_DIR="/vol2/BUSCO/bryophyte/HOG/03.len.pep"
+SPLIT_DIR="/vol2/BUSCO/bryophyte/HOG/03.len.filter.work"
+OUTPUT_DIR="/vol2/BUSCO/bryophyte/HOG/04.len.pep"
 FILES=($(ls ${PEP_DIR}/*.fa))
+TOTAL_FILES=${#FILES[@]}
+FILES_PER_DIR=$((TOTAL_FILES / 2))
+COUNTER=0
+DIR_INDEX=1
 
-# Load the necessary environment
+# Create target directories and split files
+for FILE in "${FILES[@]}"; do
+    DIR_PATH="${SPLIT_DIR}/dir_${DIR_INDEX}"
+    mkdir -p "${DIR_PATH}"
+    
+    FILE_BASENAME=$(basename "$FILE")
+    cp "$FILE" "${DIR_PATH}/"
+
+    let COUNTER=COUNTER+1
+    if [ $((COUNTER % FILES_PER_DIR)) -eq 0 ] && [ $DIR_INDEX -lt 2 ]; then
+        let DIR_INDEX=DIR_INDEX+1
+    fi
+done
+
+# Create work.sh script in each directory
+for DIR in ${SPLIT_DIR}/dir_*; do
+    cat > ${DIR}/work.sh <<EOF
+#!/bin/bash
 export PATH=/public/home/miniconda3/envs/mamba/bin/:\$PATH
 
-# Function to filter sequences based on relative standard deviation (RSD) of sequence lengths
+cd ${DIR}
+
+# Use samtools faidx to compute sequence lengths
 filter_sequences() {
     local file="\$1"
     local lengths_file="\${file}_lengths.txt"
@@ -21,7 +46,7 @@ filter_sequences() {
     # Extract sequence length information
     awk '{print \$2}' "\${file}.fai" > "\$lengths_file"
 
-    # Read lengths into an array
+    # Read length information
     lengths=(\$(cat "\$lengths_file"))
 
     # Calculate mean and standard deviation
@@ -43,19 +68,29 @@ filter_sequences() {
     fi
 
     # Set RSD threshold
-    rsd_threshold=20  # Conservative threshold, allowing 20% RSD
+    rsd_threshold=20  # Conservative setting, allows 20% RSD
 
-    # Check if RSD exceeds the threshold
+    # Check if RSD exceeds threshold
     if (( \$(echo "\$rsd > \$rsd_threshold" | bc -l) )); then
         echo "File \$file has high relative sequence length standard deviation: \$rsd%"
         return
     fi
 
-    # Copy file that meets the criteria to the output directory
+    # Copy files that meet criteria to the output directory
     cp "\$file" "\$output_file"
 }
 
-# Process each file in the PEP_DIR
-for file in "\${FILES[@]}"; do
+export -f filter_sequences
+
+# Process each file
+for file in *.fa; do
     filter_sequences "\$file"
+done
+EOF
+    chmod +x ${DIR}/work.sh
+done
+
+# Submit jobs
+for DIR in ${SPLIT_DIR}/dir_*; do
+    qsub -cwd -pe smp 1 ${DIR}/work.sh
 done
