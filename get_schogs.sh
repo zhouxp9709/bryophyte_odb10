@@ -1,96 +1,200 @@
-#!/bin/bash
+from Bio import SeqIO
+import subprocess
+import os
+import argparse
+import tempfile
+import concurrent.futures
+from functools import lru_cache
+from collections import defaultdict
+import sys
 
-# Setup environment and variables
-set -e
-PEP_DIR="/vol2/BUSCO/bryophyte/HOG/00.pep"
-SPLIT_DIR="/vol2/BUSCO/bryophyte/HOG/01.copy.filter.work"
-OUTPUT_DIR="/vol2/BUSCO/bryophyte/HOG/02.copy.pep"
-FILES=($(ls ${PEP_DIR}/*.fa))
-TOTAL_FILES=${#FILES[@]}
-FILES_PER_DIR=$((TOTAL_FILES / 30))
-COUNTER=0
-DIR_INDEX=1
+@lru_cache(maxsize=10000)
+def calculate_similarity_cached(seq1_str, seq2_str, species1, species2):
+    if species1 == species2:
+        return None
 
-# Create target directories and split files
-for FILE in "${FILES[@]}"; do
-    DIR_PATH="${SPLIT_DIR}/dir_${DIR_INDEX}"
-    mkdir -p "${DIR_PATH}"
+    temp_dir = '/dev/shm' if os.path.exists('/dev/shm') else None
     
-    FILE_BASENAME=$(basename "$FILE")
-    cp "$FILE" "${DIR_PATH}/"
+    try:
+        with tempfile.NamedTemporaryFile(dir=temp_dir, mode="w", delete=False, suffix=".fasta") as f1, \
+             tempfile.NamedTemporaryFile(dir=temp_dir, mode="w", delete=False, suffix=".fasta") as f2:
+            
+            f1.write(f">seq1\n{seq1_str}\n")
+            f2.write(f">seq2\n{seq2_str}\n")
+            temp_seq1, temp_seq2 = f1.name, f2.name
 
-    let COUNTER=COUNTER+1
-    if [ $((COUNTER % FILES_PER_DIR)) -eq 0 ] && [ $DIR_INDEX -lt 30 ]; then
-        let DIR_INDEX=DIR_INDEX+1
-    fi
-done
+        with tempfile.NamedTemporaryFile(dir=temp_dir, mode="w", delete=False, suffix=".txt") as f3:
+            needle_output = f3.name
 
-# Create work.sh script in each directory
-for DIR in ${SPLIT_DIR}/dir_*; do
-    cat > ${DIR}/work.sh <<EOF
-#!/bin/bash
-export PATH=/public/home/miniconda3/envs/mamba/bin/:\$PATH
+        subprocess.run(
+            ["needle", "-asequence", temp_seq1, "-bsequence", temp_seq2,
+             "-gapopen", "10", "-gapextend", "0.5", "-outfile", needle_output,
+             "-brief", "Y"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True
+        )
 
-cd ${DIR}
-process_hog() {
-    local file="\$1"
-    local dir=\$(dirname "\$file")
-    local base=\$(basename "\$file" .fa)
-    local output_file="${OUTPUT_DIR}/\${base}_best.fa"
-    local tmp_aligned="\${dir}/\${base}_aligned.fa"
+        similarity = 0.0
+        with open(needle_output, "r") as f:
+            for line in f:
+                if line.startswith("# Identity:"):
+                    parts = line.strip().split()
+                    identical, total = parts[2].split('/')
+                    similarity = int(identical) / int(total)
+                    break
 
-    # Perform global alignment using MAFFT
-    mafft --auto --thread 6 "\$file" > "\$tmp_aligned"
+    except Exception as e:
+        similarity = 0.0
+    finally:
+        for f in [temp_seq1, temp_seq2, needle_output]:
+            try:
+                os.remove(f)
+            except:
+                pass
 
-    # Calculate similarity matrix using ClustalW
-    clustalw -INFILE="\$tmp_aligned" -OUTPUT=FASTA
+    return similarity
 
-    # Extract gene IDs for each species
-    grep "^>" "\$tmp_aligned" | sed 's/^>//' | cut -d '|' -f 1 | sort | uniq | while read -r species; do
-        # Calculate average similarity score for each gene and save to temp file
-        local tmp_scores=\$(mktemp)
-        grep "^>\$species" "\$tmp_aligned" | while read -r gene; do
-            gene_id=\$(echo "\$gene" | sed 's/^>//')
-            sim_score=\$(grep -A 1 "\$gene" "\$tmp_aligned" | tail -n 1 | awk '{ total += length; } END { print total/NR; }')
-            echo "\$gene_id \$sim_score" >> "\$tmp_scores"
-        done
+def process_species_pair(args):
+    gene_seq_str, species, gene_id, other_species, other_genes_seqs_str = args
+    max_sim = 0.0
+    
+    if not other_genes_seqs_str:
+        return (gene_id, other_species, 0.0)
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(
+                calculate_similarity_cached,
+                gene_seq_str,
+                other_seq_str,
+                species,
+                other_species
+            ) for other_seq_str in other_genes_seqs_str
+        ]
+        
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                sim = future.result()
+                if sim and sim > max_sim:
+                    max_sim = sim
+            except Exception as e:
+                pass
+    
+    return (gene_id, other_species, max_sim)
 
-        # Select the gene with the highest similarity score
-        best_gene=\$(sort -k2,2nr "\$tmp_scores" | head -n 1 | awk '{print \$1}')
-        echo "Best \$species gene for \$file: \$best_gene"
+def read_fasta(file_path):
+    sequences = defaultdict(list)
+    try:
+        for record in SeqIO.parse(file_path, "fasta"):
+            if "|" not in record.id:
+                continue
+            species, gene_id = record.id.split("|", 1)
+            sequences[species].append(record)
+    except:
+        sys.exit(1)
+    
+    if not sequences:
+        sys.exit(1)
+    
+    return sequences
 
-        # Extract the best gene sequence from the original file and append to output
-        awk -v best_gene="\$best_gene" '
-            BEGIN { output_best = 0 }
-            /^>/ {
-                if (\$0 == ">" best_gene) {
-                    output_best = 1
-                } else {
-                    output_best = 0
-                }
-            }
-            { if (output_best) print \$0 }
-        ' "\$file" >> "\$output_file"
+def find_best_copies(sequences, num_workers, tmpdir):
+    os.environ['TMPDIR'] = tmpdir
+    species_list = list(sequences.keys())
+    best_copies = {}
 
-        # Clean up temp file
-        rm "\$tmp_scores"
-    done
+    if all(len(genes) == 1 for genes in sequences.values()):
+        return {species: genes[0] for species, genes in sequences.items()}
 
-    # Clean up temporary alignment file
-    rm "\$tmp_aligned"
-}
+    tasks = []
+    for species in species_list:
+        for gene in sequences[species]:
+            gene_seq_str = str(gene.seq)
+            gene_id = gene.id
+            for other_species in species_list:
+                if other_species == species:
+                    continue
+                other_genes = [str(g.seq) for g in sequences.get(other_species, [])]
+                if other_genes:
+                    tasks.append((
+                        gene_seq_str,
+                        species,
+                        gene_id,
+                        other_species,
+                        other_genes
+                    ))
 
-export -f process_hog
+    if tasks:
+        similarity_data = defaultdict(dict)
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(process_species_pair, task): task for task in tasks}
+            for future in concurrent.futures.as_completed(futures):
+                task = futures[future]
+                try:
+                    gene_id, other_species, max_sim = future.result()
+                    similarity_data[(gene_id, other_species)] = max_sim
+                except:
+                    pass
 
-# Process each .fa file in the directory
-for file in *.fa; do
-    process_hog "\$file"
-done
-EOF
-    chmod +x ${DIR}/work.sh
-done
+        for species in species_list:
+            if len(sequences[species]) == 1:
+                best_copies[species] = sequences[species][0]
+                continue
 
-# Submit jobs
-for DIR in ${SPLIT_DIR}/dir_*; do
-    qsub -cwd -pe smp 6 ${DIR}/work.sh
-done
+            max_avg = -1
+            best_gene = None
+            for gene in sequences[species]:
+                total = 0.0
+                count = 0
+                for other_species in species_list:
+                    if other_species == species:
+                        continue
+                    key = (gene.id, other_species)
+                    sim = similarity_data.get(key, 0)
+                    if sim > 0:
+                        total += sim
+                        count += 1
+                if count > 0:
+                    avg = total / count
+                    if avg > max_avg:
+                        max_avg = avg
+                        best_gene = gene
+            
+            if best_gene:
+                best_copies[species] = best_gene
+    
+    else:
+        for species in species_list:
+            best_copies[species] = sequences[species][0]
+
+    return best_copies
+
+def write_output(best_copies, output_file):
+    try:
+        with open(output_file, "w") as f:
+            for species, record in best_copies.items():
+                SeqIO.write(record, f, "fasta")
+    except:
+        sys.exit(1)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input")
+    parser.add_argument("output")
+    parser.add_argument("-j", "--workers", type=int, default=os.cpu_count())
+    parser.add_argument("-t", "--tmpdir", default="/tmp")
+    
+    args = parser.parse_args()
+    
+    if not os.path.exists(args.input):
+        sys.exit(1)
+    
+    os.makedirs(args.tmpdir, exist_ok=True)
+    
+    sequences = read_fasta(args.input)
+    best_copies = find_best_copies(sequences, args.workers, args.tmpdir)
+    write_output(best_copies, args.output)
+
+if __name__ == "__main__":
+    main()
